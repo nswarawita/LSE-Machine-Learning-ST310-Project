@@ -1,0 +1,684 @@
+---
+title: "ST310 Final R Markdown"
+author: "16923, 17915, 22220"
+date: "4/6/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(max.print = 1000000)
+```
+
+# ST310 Machine Learning Project: Understanding and Predicting Stroke Occurrences in Imbalanced Data
+
+### Load the dataset
+```{r}
+data <- read.csv("healthcare-dataset-stroke-data.csv", header=TRUE)
+data <- subset(data, select= -c(1)) #remove the id from the dataframe
+```
+
+### Load the required packages
+```{r}
+library(tidyverse); library(ggplot2); library(GGally); library(corrplot); library(SmartEDA); 
+library(dplyr); library(DataExplorer); library(tibble); library(naniar); library(gridExtra); 
+library(caret); library(caTools); library(xgboost); library(broom); library(kernlab); 
+library(MASS); library(modelr); library(glmnet); library(selectiveInference); library(imbalance)
+```
+
+## EDA-----------------------------------------------------------------------------------
+
+### Inspect the data
+```{r}
+dim(data) # 5110 rows and 11 columns
+str(data)
+summary(data)
+```
+ - Several categorical predictors are wrongly coded as numerical and vice versa. 
+ - Gender has a single datapoint that falls into the level titled 'Other'
+ - bmi has 201 N/A values
+ - smoking_status has a category titled 'Unknown'
+ - Minimum age is 0.08
+ 
+```{r}
+sum(data$age<1) ### 43 people are less than a year old
+```
+
+
+### Data preparation
+```{r}
+# Remove the datapoint that falls under the level titled 'Other' for gender
+data[data$gender=='Other',] # Iddentify the row corresponding to this datapoint
+data <- data[-3117,] # Remove the datapoint
+data$gender <- fct_drop(data$gender) # Remove the level 'Other'
+
+# Convert hypertension, heart_disease and stroke to categorical 
+data$hypertension <- as.factor(data$hypertension)
+data$heart_disease <- as.factor(data$heart_disease)
+data$stroke <- as.factor(data$stroke)
+
+# Convert bmi too numeric
+data$bmi <- as.character(data$bmi)
+data$bmi <- as.numeric(data$bmi)
+
+summary(data) # Changes have been made
+```
+
+### Iddentifying N/A values
+```{r}
+# Plot the amount of missing values for each of the parameters in the dataset 
+plot_missing(data) # 4% of BMI is missing
+
+# Replace the "N/A" in bmi & "Unknown" in Smoking status using the naniar package
+data_clean <- replace_with_na(data = data, replace = list(bmi = c("N/A"), smoking_status = c("Unknown"))) 
+
+vis_miss(data_clean) #plot where missing values for each of the parameter in the dataset are + percent missing
+#30% of the data is missing for smoking and 4% is missing for bmi
+
+sapply(data_clean, function(x) sum(is.na(x))) 
+#201 missing values for BMI and 1544 missing values for smoking_status
+
+summary(data_clean) # The changes have been made
+```
+
+We have 2 possible approaches that we can take when dealing with the N/A values:
+1. Remove the rows containing N/A values   
+2. Impute the bmi/smoking_status values with the most common value (mode)
+
+#### Method 1 - Remove the rows containing N/A values
+```{r}
+data_remove <- data_clean[complete.cases(data_clean), ] 
+data_remove$smoking_status <- fct_drop(data_remove$smoking_status) # Remove 'Unknown' as a level of the predictor smoking_status
+
+dim(data_remove) #3425 observations
+summary(data_remove)
+```
+
+
+#### Method 2 - Impue values for the N/A values
+```{r}
+data_impute <- impute_median_at(data_clean, .vars=c("bmi")) #impute bmi at median value using the naniar package
+data_impute <- fill(data_clean, smoking_status) #fills missing values using the previous entry, assumption that variables are missing at random
+dim(data_impute) #5110
+```
+
+### We decided to remove the rows that contained N/A values (method 1) for a number of reasons explained in the report
+
+### Conducting a univariate analysis of the variables
+
+#### Plot histograms for the continuous variables
+```{r}
+age <- ggplot(data_remove, aes(x=age)) + geom_histogram(fill = "blue") 
+#approx normally distributed
+avg_glucose_level <- ggplot(data_remove, aes(x=avg_glucose_level)) + geom_histogram(fill = "blue")
+#bi-modal
+bmi <- ggplot(data_remove, aes(x=bmi)) + geom_histogram(fill = "blue")
+#approx positively skewed
+
+grid.arrange( age, avg_glucose_level, bmi, ncol=1)
+```
+
+#### Plot bar charts to observe the categorical variables
+```{r}
+stroke <- ggplot(data_remove, aes(x=stroke)) + geom_bar(stat='count', fill = "red")
+gender <- ggplot(data_remove, aes(x=gender)) + geom_bar(stat='count', fill = "red")
+hypertension <- ggplot(data_remove, aes(x=hypertension)) + geom_bar(stat='count', fill = "red")
+heart_disease <- ggplot(data_remove, aes(x=heart_disease)) + geom_bar(stat='count', fill = "red")
+ever_married <- ggplot(data_remove, aes(x=ever_married)) + geom_bar(stat='count', fill = "red")
+work_type <- ggplot(data_remove, aes(x=work_type)) + geom_bar(stat='count', fill = "red")
+Residence_type <- ggplot(data_remove, aes(x=Residence_type)) + geom_bar(stat='count', fill = "red")
+smoking_status <- ggplot(data_remove, aes(x=smoking_status)) + geom_bar(stat='count', fill = "red")
+
+grid.arrange(stroke, gender, hypertension, heart_disease, ever_married, work_type, Residence_type, smoking_status, ncol=2)
+```
+
+#### Plot boxplots to determine the relationship between stroke and the continuous predictors
+```{r}
+age_boxplot <- ggplot(data = data_remove, aes(stroke, age)) + 
+  geom_boxplot()
+avg_glucose_level_boxplot <- ggplot(data = data_remove, aes(stroke, avg_glucose_level)) + 
+  geom_boxplot()
+bmi_boxplot <- ggplot(data = data_remove, aes(stroke, bmi)) + 
+  geom_boxplot()
+grid.arrange( age_boxplot, avg_glucose_level_boxplot, bmi_boxplot, nrow=2)
+```
+
+### Observe the correlation among variables
+
+Create subsets of the continuous & discrete variables
+```{r}
+contVars <- subset(data_remove, select=c(age, avg_glucose_level,bmi, stroke))
+discVars <- subset(data_remove, select=c(gender, hypertension, heart_disease, ever_married, work_type, Residence_type, smoking_status, stroke))
+```
+
+#### Pairwise correlations
+```{r}
+disccorr <- ggpairs(discVars)
+disccorr 
+contcorr <- ggpairs(contVars)
+contcorr
+```
+
+
+## Observe the distribution of people who had a stroke-------------------------------------
+```{r}
+table(data_remove$stroke) #180 total people with a stroke, 3246 with no stroke
+3245/(180+3245) # Percentage of people who had no stroke
+```
+
+ - There is a massive class imbalance
+ - This can be rectified using several methods such as undersampling, oversampling etc.
+ 
+Dummy model: If we build a model to continuously predict that an individual does not have a stroke, the misclassification rate would be 5% (1-0.9474606)
+
+There are several ways of dealing with the imbalance in the dataset. We will focus on 2 of them
+1. Undersampling - Downsampling the larger class 
+2. Oversampling - Oversampling the minority class 
+
+We will develop our models under both methods
+
+## 1. Using undersampling
+
+Create a balanced dataset with the same number of observations in both classes (in Stroke) using undersampling
+```{r}
+stroke_No <- data_remove %>%
+  filter(stroke == 0) %>%
+  sample_n(size = 180)
+
+stroke_Yes <- data_remove %>%
+  filter(stroke == 1)
+
+data_under <- rbind(stroke_No, stroke_Yes)
+summary(data_under)
+```
+
+Create the training and testing data for the dataset obtained using undersampling
+```{r}
+set.seed(4)
+
+data_under$id <- 1:nrow(data_under) # Create an id
+training_under <- data_under %>% sample_frac(.7)
+testing_under  <- anti_join(data_under, training_under, by = 'id')
+training_under <- training_under %>% dplyr::select(-id) 
+testing_under <- testing_under %>% dplyr::select(-id)
+beta_testing_under <- testing_under %>% dplyr::select(-stroke)
+
+#summary(training_under)
+#dim(training_under)
+#summary(testing_under)
+#dim(testing_under)
+```
+
+
+
+## 2. Using oversampling
+
+Create a balanced dataset with the same number of observations in both classes using oversampling
+```{r}
+data_over <- data_remove
+
+# Compute the imbalance ratio of stroke 
+imbalanceRatio(as.data.frame(data_over), classAttr = "stroke")
+
+# Name the levels of stroke
+data_over$stroke <- as.factor(ifelse(data_over$stroke == 0, "no", "yes"))
+
+# Put variables as correct format
+data_over$gender <- as.factor(data_over$gender)
+data_over$hypertension <- as.factor(data_over$hypertension)
+data_over$heart_disease <- as.factor(data_over$heart_disease)
+data_over$ever_married <- as.factor(data_over$ever_married)
+data_over$work_type <- as.factor(data_over$work_type)
+data_over$Residence_type <- as.factor(data_over$Residence_type)
+data_over$smoking_status <- as.factor(data_over$smoking_status)
+data_over <- as.data.frame(lapply(data_over, as.numeric))
+
+
+data_over <- oversample(as.data.frame(data_over), classAttr = "stroke", ratio = 1, method = "MWMOTE")
+
+data_over$stroke <- as.factor(data_over$stroke)
+
+table(data_over$stroke)
+#Bot as is no shown, there are now equally as many stroke cases as non-stroke cases
+summary(data_over)
+
+```
+
+Create the training and testing data for the dataset obtained using oversampling
+```{r}
+data_over$id <- 1:nrow(data_over)
+training_over <- data_over %>% sample_frac(.7)
+testing_over  <- anti_join(data_over, training_over, by = 'id')
+training_over <- training_over %>% dplyr::select(-id)
+testing_over <- testing_over %>% dplyr::select(-id)
+beta_testing_over <- testing_over %>% dplyr::select(-stroke)
+
+dim(training_over) #4543 observations
+dim(testing_over) #1947 observations
+```
+
+
+# Models developed using undersampling--------------------
+
+## Model 1: Logistic regression 
+
+stepAIC in the MASS package package was used to obtain the model that contains the most contributive predictors by minimising AIC 
+
+```{r}
+# Build a glm with all the predictors
+glm_all_under <- glm(stroke~., family=binomial(link = "logit"), data=training_under)
+
+# Build a glm with only the most contributive predictors
+glm_under <- glm_all_under %>% stepAIC(trace = FALSE)
+# trace = FALSE allows the function to provide only the model with the lowest AIC and none of the intermediary models
+summary(glm_under)
+
+#Create a visual representation of the logistic model
+predicted.data <- data.frame(
+  probability.of.stroke = glm_under$fitted.values,
+  stroke=training_under$stroke)
+
+predicted.data <- predicted.data[
+  order(predicted.data$probability.of.stroke, decreasing=FALSE),]
+predicted.data$rank <- 1:nrow(predicted.data)
+
+ggplot(data=predicted.data, aes(x=rank, y=probability.of.stroke)) +
+  geom_point(aes(color=stroke), alpha=1, shape=8, size = 2, stroke = 2) +
+  xlab("id corresponding to the datapoint") +
+  ylab("Predicted probability of stroke")
+
+# Predict the testing data using the glm  
+pred_glm_under = predict(glm_under, testing_under, type="response")
+pred_glm_under <- ifelse((pred_glm_under>=0.3), 1, 0) # This threshold value was one of the values that were preset  
+
+# Create a confusion matrix to assess the performance of the model
+conf_matrix_glm_under <- table(pred_glm_under, testing_under$stroke, deparse.level = 2)
+conf_matrix_glm_under
+
+```
+
+Comparing glm_all_under and glm_under
+```{r}
+rbind(glance(glm_all_under), glance(glm_under))
+```
+
+## Model 2: Linear model to predict stroke implemented using gradient descent
+
+Preprocess the data 
+```{r}
+x_var_train_for_lm_under  <- training_under %>% 
+  dplyr::select(age, bmi) 
+
+# Create a design matrix for the training data 
+X_train_for_lm_under <- model.matrix(~. -1, data = x_var_train_for_lm_under) # -1 removes the intercept from the matrix
+
+# Convert stroke to numeric
+train_under_2 <- training_under
+train_under_2$stroke <- as.numeric(train_under_2$stroke)
+Y_train_for_lm_under <- train_under_2 %>% pull(stroke) 
+
+x_var_test_for_lm_under  <- testing_under %>% 
+  dplyr::select(age, bmi) 
+
+# Create a design matrix for the testing data
+X_test_for_lm_under <- model.matrix(~. -1, data = x_var_test_for_lm_under)  
+
+# Convert stroke to numeric
+test_under_2 <- testing_under
+test_under_2$stroke <- as.numeric(test_under_2$stroke)
+
+Y_test_for_lm_under <- test_under_2 %>% pull(stroke)
+
+dim(X_train_for_lm_under) #252
+dim(X_test_for_lm_under) #108
+```
+
+
+```{r}
+# Define the least squares function
+least_squares_gradient <- function(x, y, beta) {
+  -2 * t(x)  %*% (y - x  %*% beta)
+}
+# t(x) is the transpose of x  
+
+# Define the loss function
+least_squares_loss <- function(x, y, beta) {
+  sum((y - x %*% beta)^2)
+}
+
+# Initialize coefficients
+gamma = 0.000001 # this is the step size
+p = 2 # This is the number of predictors
+
+beta0 <- rep(0, p) # This is the vector of all 0s
+previous_loss <- least_squares_loss(X_train_for_lm_under, Y_train_for_lm_under, beta0) # Loss function at the starting point
+grad0 <- least_squares_gradient(X_train_for_lm_under, Y_train_for_lm_under, beta0) # Initialise the gradient
+beta1 <- beta0 - gamma * grad0 
+next_loss <- least_squares_loss(X_train_for_lm_under, Y_train_for_lm_under, beta1)
+previous_beta <- beta1
+steps <- 1
+
+while (abs(previous_loss - next_loss) > 0.00001) {
+  gradn <- least_squares_gradient(X_train_for_lm_under, Y_train_for_lm_under, previous_beta)
+  # Refine update by allowing step size to change at each iteration. Make step size a sequence of numbers -> 0 to prevent overshooting min, (1) .99^steps,  
+  next_beta <- previous_beta - (0.99)^steps * gradn / sqrt(sum(gradn^2))
+  # We rescale the gradient i.e. use sqrt(sum(gradn^2)) to prevent the algorithm from diverging
+  steps <- steps + 1
+  previous_beta <- next_beta
+  previous_loss <- next_loss
+  next_loss <- least_squares_loss(X_train_for_lm_under, Y_train_for_lm_under, next_beta)
+}
+
+# Predict the expected values for the testing data
+pred_lm_grad_desc_under = X_test_for_lm_under %*% previous_beta
+pred_lm_grad_desc_under = round(as.integer(pred_lm_grad_desc_under))
+pred_lm_grad_desc_under = as.factor(pred_lm_grad_desc_under)
+
+# Create a confusion matrix to assess the performance of the model on the testing data
+table(pred_lm_grad_desc_under, testing_under$stroke, deparse.level = 2) 
+# Variable that is rounded to 2, is actually a 1, as 0 and 1 are the only outcomes
+```
+
+
+## Model 3: Lasso (least absolute shrinkage and selection operator) regression 
+
+Preprocess this data to use for lasso
+```{r}
+x_var_train_for_lasso_under  <- training_under %>% 
+  dplyr::select(-stroke) 
+
+# Create a design matrix for the training data 
+X_train_for_lasso_under <- model.matrix(~. -1, data = x_var_train_for_lasso_under) # -1 removes the intercept from the matrix
+
+Y_train_for_lasso_under <- training_under %>% pull(stroke) 
+
+x_var_test_for_lasso_under  <- testing_under %>% 
+  dplyr::select(-stroke) 
+
+# Create a design matrix for the testing data
+X_test_for_lasso_under <- model.matrix(~. -1, data = x_var_test_for_lasso_under) # 
+
+Y_test_for_lasso_under <- testing_under %>% pull(stroke) 
+
+dim(X_train_for_lasso_under) #252
+dim(X_test_for_lasso_under) #108
+
+```
+
+The model was created using lambda.min as the best lambda
+```{r}
+#Perform 10 fold cross validation using the misclassification rate to find the best lambda 
+lasso_cv_under = cv.glmnet(X_train_for_lasso_under,
+                  Y_train_for_lasso_under,
+                  family = "binomial",
+                  type.measure = "class") # type.measure = "class" allows us to use the misclassification rate as the criterion
+#plot(lasso_cv_under)
+
+# Fit the lasso model on the training data
+lasso_under <- glmnet(X_train_for_lasso_under,
+                         Y_train_for_lasso_under,
+                         alpha = 1,
+                         family = "binomial",
+                         lambda = lasso_cv_under$lambda.min)
+
+# Predict the testing data using the glm 
+pred_lasso_under <- lasso_under %>% predict(newx = X_test_for_lasso_under)
+pred_lasso_under <- ifelse(pred_lasso_under >= 0.3, 1, 0)
+
+# Create a confusion matrix to assess the performance of the model
+table(pred_lasso_under, Y_test_for_lasso_under, deparse.level = 2) 
+```
+
+
+## Model 4: kernel method 
+```{r}
+# Build the model using training data
+kvsm_under <- ksvm(stroke ~ age + hypertension + heart_disease + avg_glucose_level + smoking_status , kernal = 'rbfdot', data = training_under)
+kvsm_under
+
+# Predict the testing data using the model built 
+pred_kvsm_under <- predict(kvsm_under, type = 'response', newdata = testing_under)
+
+# Create a confusion matrix to assess the performance of the model
+conf_matrix_kvsm_under<-table(Predicted=pred_kvsm_under,Reference=testing_under[,11])
+confusionMatrix(conf_matrix_kvsm_under, stroke = 1)
+```
+
+## Model 5: random forest building 
+```{r}
+# Set the parameters for the train function
+rftunegrid <- data.frame(
+  .mtry=c(2,3,4,5,6), .splitrule="gini", .min.node.size=5
+)
+rfcontrol <- trainControl(
+  method="oob", number=5, verboseIter=TRUE
+)
+
+# Build the model
+randomforest_under <- train(
+  stroke~., training_under, method="ranger", tuneLength=3, tuneGrid= rftunegrid, trControl=rfcontrol
+)
+
+randomforest_under
+
+# Predict the testing data using the model built
+randomforest_under_prediction <- predict(randomforest_under, newdata=beta_testing_under)
+
+# Create a confusion matrix to assess the performance of the model on the testing data
+confusionMatrix(randomforest_under_prediction, factor(testing_under[["stroke"]]), positive = "1")
+
+```
+
+## Model 6: extreme gradient boosting tree 
+```{r}
+# Set the parameters for the train function
+xgbgrid <- expand.grid(
+  nrounds = 3500, max_depth = 7, eta = 0.01, gamma = 0.01,
+  colsample_bytree = 0.75, min_child_weight = 0, subsample = 0.5
+)
+
+xgbcontrol <- trainControl(
+  method = "cv", number = 5
+)
+
+# Build the model
+xgb_under <- train(
+  stroke ~ ., training_under, method = "xgbTree", tuneLength = 3, tuneGrid = xgbgrid, trControl = xgbcontrol
+)
+
+xgb_under
+
+# Predict the testing data using the model built
+xbg_pred <- predict(xgb_under, newdata = beta_testing_under) 
+
+# Create a confusion matrix to assess the performance of the model on the testing data
+confusionMatrix(xbg_pred, factor(testing_under[["stroke"]]), positive = "1")
+```
+
+
+# Models developed using oversampling--------------------
+
+## Model 1: Logistic regression 
+
+```{r}
+glm_all_over <- glm(stroke~., family=binomial(link = "logit"), data=training_over)
+glm_over <- glm_all_over %>% stepAIC(trace = FALSE) 
+summary(glm_over)
+
+# create a confusion matrix 
+pred_glm_over = predict(glm_over, testing_over, type="response")
+pred_glm_over <- ifelse((pred_glm_over>=0.3), 1, 0) # This value was preset
+conf_matrix_over <- table(pred_glm_over, testing_over$stroke, deparse.level = 2)
+conf_matrix_over
+```
+
+## Model 2: Linear regression to predict using gradient descent 
+
+Preprocess the data 
+```{r}
+x_var_train_for_lm_over  <- training_over %>% 
+  dplyr::select(age, bmi) 
+
+# Create a design matrix for the training data 
+X_train_for_lm_over <- model.matrix(~. -1, data = x_var_train_for_lm_over) # -1 removes the intercept from the matrix
+
+train_over_2 <- training_over
+train_over_2$stroke <- as.numeric(train_over_2$stroke)
+
+Y_train_for_lm_over <- train_over_2 %>% pull(stroke) 
+
+x_var_test_for_lm_over  <- testing_over %>% 
+  dplyr::select(age, bmi) 
+
+# Create a design matrix for the testing data
+X_test_for_lm_over <- model.matrix(~. -1, data = x_var_test_for_lm_over) # 
+
+test_over_2 <- training_over
+test_over_2$stroke <- as.numeric(test_over_2$stroke)
+
+Y_test_for_lm_over <- test_over_2 %>% pull(stroke)
+
+dim(X_train_for_lm_over) #4543
+dim(X_test_for_lm_over) #1947
+```
+
+```{r}
+# Initialize coefficients
+gamma = 0.000001 # this is the step size
+p = 2 # This is the number of predictors
+
+beta0 <- rep(0, p) # This is the vector of all 0s
+previous_loss <- least_squares_loss(X_train_for_lm_over, Y_train_for_lm_over, beta0) # Loss function at the starting point
+grad0 <- least_squares_gradient(X_train_for_lm_over, Y_train_for_lm_over, beta0) # Initialise gradient
+beta1 <- beta0 - gamma * grad0 
+next_loss <- least_squares_loss(X_train_for_lm_over, Y_train_for_lm_over, beta1)
+previous_beta <- beta1
+steps <- 1
+
+while (abs(previous_loss - next_loss) > 0.00001) {
+  gradn <- least_squares_gradient(X_train_for_lm_over, Y_train_for_lm_over, previous_beta)
+  # Refine update by allowing step size to change at each iteration. Make step size a sequence of numbers -> 0 to prevent overshooting min, (1) .99^steps,  
+  next_beta <- previous_beta - (0.99)^steps * gradn / sqrt(sum(gradn^2))
+  # We rescale the gradient i.e. use sqrt(sum(gradn^2)) to prevent the algorithm from diverging
+  steps <- steps + 1
+  previous_beta <- next_beta
+  previous_loss <- next_loss
+  next_loss <- least_squares_loss(X_train_for_lm_over, Y_train_for_lm_over, next_beta)
+}
+
+# Use the model the parameter estimates obtained using gradient descent to predict the testing data
+pred_lm_grad_desc_over = X_test_for_lm_over %*% previous_beta
+pred_lm_grad_desc_over = round(as.integer(pred_lm_grad_desc_over))
+pred_lm_grad_desc_over = as.factor(pred_lm_grad_desc_over + 1) 
+
+# Create a confusion matrix to see how well the testing data is predicted 
+table(pred_lm_grad_desc_over, testing_over$stroke, deparse.level = 2)
+```
+
+
+## Model 3: Lasso (least absolute shrinkage and selection operator) regression 
+
+Preprocess this data to use for lasso
+```{r}
+x_var_train_for_lasso_over  <- training_over %>% 
+  dplyr::select(-stroke) 
+# Create the design matrix for the training data
+X_train_for_lasso_over <- model.matrix(~. -1, data = x_var_train_for_lasso_over) 
+
+Y_train_for_lasso_over <- training_over %>% pull(stroke) 
+
+x_var_test_for_lasso_over  <- testing_over %>% 
+  dplyr::select(-stroke) 
+# Create the design matrix for the testing data
+X_test_for_lasso_over <- model.matrix(~. -1, data = x_var_test_for_lasso_over) 
+
+Y_test_for_lasso_over <- testing_over %>% pull(stroke)
+
+dim(X_train_for_lasso_over)
+dim(X_test_for_lasso_over)
+```
+
+```{r}
+#Perform 10 fold cross validation using the misclassification rate to find the best lambda 
+lasso_cv_over = cv.glmnet(X_train_for_lasso_over,
+                  Y_train_for_lasso_over,
+                  family = "binomial",
+                  type.measure = "class") # type.measure = "class" allows us to use the misclassification rate as the criterion
+plot(lasso_cv_over)
+
+# Fit the lasso model on the training data
+lasso_over <- glmnet(X_train_for_lasso_over,
+                         Y_train_for_lasso_over,
+                         alpha = 1,
+                         family = "binomial",
+                         lambda = lasso_cv_over$lambda.min)
+
+coef(lasso_over)  # Observe what coefficients are included in the model
+
+# Making predictions based off of testing data
+pred_lasso_over <- lasso_over %>% predict(newx = X_test_for_lasso_over)
+pred_lasso_over <- ifelse(pred_lasso_over >= 0.3, 1, 0)
+table(pred_lasso_over, Y_test_for_lasso_over, deparse.level = 2)
+``` 
+## Model 4: Kernel Methods 
+```{r}
+# Find the value of gamma that minimizes the number of false negatives
+try <- -100:100 # List of possible values for gamma
+false_neg <- data.frame()
+error <- data.frame()
+for (gam in c(-100:100)){
+  # Create the model using training data
+  kvsm_over <- ksvm(stroke ~ ., kernal = 'rbfdot', data = training_over, gamma = gam)
+  pred_kvsm_over <- predict(kvsm_over, type = 'response', newdata = training_over)
+  pred_kvsm_over <- round(as.numeric(pred_kvsm_over))
+  pred_kvsm_over <- as.factor(pred_kvsm_over)
+  conf_mat <- as.factor(training_over[,11])
+  # Substract accuracy from the false positives
+  ans = (confusionMatrix(pred_kvsm_over, conf_mat)[[2]][3]) - confusionMatrix(pred_kvsm_over, conf_mat)[[3]][[1]] 
+  # As accuracy < 1, this will give us the value with the highest accuracy out of those with the joint lowest false positives 
+  false_neg <- rbind(false_neg, ans)
+}
+
+try[which(false_neg == min(false_neg))] # Choose one of these values as gamma 
+
+kvsm_over <- ksvm(stroke ~ ., kernal = 'rbfdot', data = training_over, gamma = 10)
+pred_kvsm_over <- predict(kvsm_over, type = 'response', newdata = testing_over)
+pred_kvsm_over <- round(as.numeric(pred_kvsm_over))
+pred_kvsm_over <- as.factor(pred_kvsm_over)
+conf_mat <- as.factor(testing_over[,11])
+confusionMatrix(pred_kvsm_over, conf_mat)
+```
+
+## Model 5: Random Forest 
+```{r}
+# Build the model using the training data
+randomforest_over <- train(
+  stroke~., training_over, method="ranger", tuneLength=3, tuneGrid= rftunegrid, trControl=rfcontrol
+)
+
+randomforest_over
+
+# Making predictions based off of testing data
+pred_randomforest_over<- predict(randomforest_over, newdata=beta_testing_over)
+
+# Create a confusion matrix
+confusionMatrix(pred_randomforest_over, factor(testing_over[["stroke"]]), positive = "1")
+```
+
+## Model 6: Extreme gradient boosting tree
+```{r}
+# Build the model using the training data
+xgb_over <- train(
+  stroke ~ ., training_over, method = "xgbTree", tuneLength = 3, tuneGrid = xgbgrid, trControl = xgbcontrol
+)
+
+xgb_over
+
+# Making predictions based off of testing data
+pred_xgb_over <- predict(xgb_over, newdata = beta_testing_over) 
+
+# Create a confusion matrix
+confusionMatrix(pred_xgb_over, factor(testing_over[["stroke"]]), positive = "1")
+```
